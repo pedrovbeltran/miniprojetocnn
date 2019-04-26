@@ -19,16 +19,24 @@ convolutional neural nets (notably,
 http://deeplearning.net/tutorial/lenet.html ), from Misha Denil's
 implementation of dropout (https://github.com/mdenil/dropout ), and
 from Chris Olah (http://colah.github.io ).
+Written for Theano 0.6 and 0.7, needs some changes for more recent
+versions of Theano. 
 
 Note by Pedro: This is my modified version of Nielsen's original code
                which includes some adaptations for Python 3 and due to
                my university project and soon It'll be included early
-               stopping.
+               stopping. And also this version includes the calculus of
+               accuracy by class, which was very difficult to me to
+               implement, but here it is. The SGD function now also returns
+               the general test accuracy and by class.
+               * Modifications for Theano 1.0.4 were made too.
+IMPORTANT:     This code will work only if you have the output layer
+               one-hot-encoded (one unit by class)
 """
 
 #### Libraries
 # Standard library
-import pickle
+import pickle as cPickle
 import gzip
 
 # Third-party libraries
@@ -39,22 +47,19 @@ from theano.tensor.nnet import conv2d
 from theano.tensor.nnet import softmax
 from theano.tensor import shared_randomstreams
 from theano.tensor.signal.pool import pool_2d
-
+from theano import In
 # Activation functions for neurons
 def linear(z): return z
 def ReLU(z): return T.maximum(0.0, z)
 from theano.tensor.nnet import sigmoid
 from theano.tensor import tanh
 
-
-# Unfortunately, I couldn't use my GPU to help the process :(
+# Unfortunately, I'm not able to run the code with my GPU due to NVIDIA issues
 
 #### Load the MNIST data
-# In "filename", this was my particular path to the file, in order for this
-# to work in your case, you need to edit it!
 def load_data_shared(filename="/home/pedro/mnist.pkl.gz"):
     f = gzip.open(filename, 'rb')
-    training_data, validation_data, test_data = pickle.load(f, encoding="latin1")
+    training_data, validation_data, test_data = cPickle.load(f, encoding="latin1")
     f.close()
     def shared(data):
         """Place the data into shared variables.  This allows Theano to copy
@@ -82,7 +87,7 @@ class Network(object):
         self.y = T.ivector("y")
         init_layer = self.layers[0]
         init_layer.set_inpt(self.x, self.x, self.mini_batch_size)
-        for j in range(1, len(self.layers)): # xrange() was renamed to range() in Python 3.
+        for j in range(1, len(self.layers)):
             prev_layer, layer  = self.layers[j-1], self.layers[j]
             layer.set_inpt(
                 prev_layer.output, prev_layer.output_dropout, self.mini_batch_size)
@@ -90,8 +95,7 @@ class Network(object):
         self.output_dropout = self.layers[-1].output_dropout
 
     def SGD(self, training_data, no_improvement_in, mini_batch_size, eta,
-            validation_data, test_data, lmbda=0.0, max_epochs=0,
-            monitor_test=False):
+            validation_data, test_data, lmbda=0.0, monitor_test=False):
         """Train the network using mini-batch stochastic gradient descent."""
         training_x, training_y = training_data
         validation_x, validation_y = validation_data
@@ -113,6 +117,7 @@ class Network(object):
         # define functions to train a mini-batch, and to compute the
         # accuracy in validation and test mini-batches.
         i = T.lscalar() # mini-batch index
+        n_class = T.bscalar() # number of the class
         train_mb = theano.function(
             [i], cost, updates=updates,
             givens={
@@ -137,6 +142,22 @@ class Network(object):
                 self.y:
                 test_y[i*self.mini_batch_size: (i+1)*self.mini_batch_size]
             })
+        test_mb_accuracies_by_class = theano.function(
+            [i, n_class], self.layers[-1].accuracies_by_class(self.y, n_class),
+            givens={
+                self.x:
+                test_x[i*self.mini_batch_size: (i+1)*self.mini_batch_size],
+                self.y:
+                test_y[i*self.mini_batch_size: (i+1)*self.mini_batch_size]
+            }, on_unused_input='ignore')
+        test_mb_per_by_class = theano.function(
+            [i, n_class], self.layers[-1].per_by_class(self.y, n_class),
+            givens={
+                self.x:
+                test_x[i*self.mini_batch_size: (i+1)*self.mini_batch_size],
+                self.y:
+                test_y[i*self.mini_batch_size: (i+1)*self.mini_batch_size]
+            }, on_unused_input='ignore')
         self.test_mb_predictions = theano.function(
             [i], self.layers[-1].y_out,
             givens={
@@ -147,28 +168,26 @@ class Network(object):
         best_test_accuracy = 0.0
         best_validation_accuracy = 0.0
         epoch = 0
-        i = -1
+        it = -1
         #Keep trace of the test accuracy
         if monitor_test:
             test_acc = []
+            test_acc_by_class = []
         while True:
-            i += 1
+            it += 1
             epoch += 1
             for minibatch_index in range(num_training_batches):
                 iteration = num_training_batches*epoch+minibatch_index
-                #if iteration % 1000 == 0:
-                #    print("Training mini-batch number {0}".format(iteration))
                 cost_ij = train_mb(minibatch_index)
                 if (iteration+1) % num_training_batches == 0:
-                    validation_accuracy = np.mean(
-                        [validate_mb_accuracy(j) for j in range(num_validation_batches)])
-                    #print("Epoch {0}: validation accuracy {1:.2%}".format(
-                    #    epoch, validation_accuracy))
+                    validation_accuracy = np.mean([validate_mb_accuracy(j) for j in range(num_validation_batches)])
                     if validation_accuracy >= best_validation_accuracy:
-                        #print("This is the best validation accuracy to date.")
+                        #print("This is the best total validation accuracy to date.")
                         best_validation_accuracy = validation_accuracy
                         best_iteration = iteration
-                        i = -1
+                        test_accuracies_by_class = [0]*self.layers[-1].n_out
+                        test_per_by_class = [0]*self.layers[-1].n_out
+                        it = -1
                     if test_data:
                         test_accuracy = np.mean(
                             [test_mb_accuracy(j) for j in range(num_test_batches)])
@@ -177,18 +196,25 @@ class Network(object):
                         if test_accuracy > best_test_accuracy:
                             best_test_accuracy = test_accuracy
                             best_iteration_acc = iteration
-                        #print('The corresponding test accuracy is {0:.2%}'.format(
-                        #    test_accuracy))
-            if i >= no_improvement_in:
+                        # If you want to track visually your progress, uncomment the following lines:
+                        #print("Epoch {0}: test accuracy {1:.2%}".format(
+                        #       epoch, test_accuracy))
+                        if monitor_test:
+                            for i in range(self.layers[-1].n_out):
+                                test_accuracies_by_class[i] = np.mean([test_mb_accuracies_by_class(j,i) for j in range(num_test_batches)]) / \
+                                                              np.mean([test_mb_per_by_class(j,i) for j in range(num_test_batches)])
+                            test_acc_by_class.append(test_accuracies_by_class)
+                                                
+            if it >= no_improvement_in:
                 break
         print("Finished training network after {} epochs.".format(epoch))
         print("Best test accuracy of {0:.2%} obtained at iteration {1}".format(
             best_test_accuracy, best_iteration_acc))
         print("Best validation accuracy of {0:.2%} obtained at iteration {1}".format(
             best_validation_accuracy, best_iteration))
+
         if monitor_test:
-            return test_acc
-        #print("Corresponding test accuracy of {0:.2%}".format(test_accuracy))
+            return test_acc, np.transpose(test_acc_by_class)
 
 #### Define layer types
 
@@ -199,19 +225,19 @@ class ConvPoolLayer(object):
     simplifies the code, so it makes sense to combine them.
     """
 
-    def __init__(self, filter_shape, image_shape, poolsize=(2, 2),
+    def __init__(self, filter_shape, input_shape, poolsize=(2, 2),
                  activation_fn=sigmoid):
         """`filter_shape` is a tuple of length 4, whose entries are the number
         of filters, the number of input feature maps, the filter height, and the
         filter width.
-        `image_shape` is a tuple of length 4, whose entries are the
+        `input_shape` is a tuple of length 4, whose entries are the
         mini-batch size, the number of input feature maps, the image
         height, and the image width.
         `poolsize` is a tuple of length 2, whose entries are the y and
         x pooling sizes.
         """
         self.filter_shape = filter_shape
-        self.image_shape = image_shape
+        self.input_shape = input_shape
         self.poolsize = poolsize
         self.activation_fn=activation_fn
         # initialize weights and biases
@@ -229,10 +255,10 @@ class ConvPoolLayer(object):
         self.params = [self.w, self.b]
 
     def set_inpt(self, inpt, inpt_dropout, mini_batch_size):
-        self.inpt = inpt.reshape(self.image_shape)
+        self.inpt = inpt.reshape(self.input_shape)
         conv_out = conv2d(
             input=self.inpt, filters=self.w, filter_shape=self.filter_shape,
-            input_shape=self.image_shape)
+            input_shape=self.input_shape)
         pooled_out = pool_2d(
             input=conv_out, ws=self.poolsize, ignore_border=True)
         self.output = self.activation_fn(
@@ -272,6 +298,12 @@ class FullyConnectedLayer(object):
     def accuracy(self, y):
         "Return the accuracy for the mini-batch."
         return T.mean(T.eq(y, self.y_out))
+    
+    def per_by_class(self, y, n_class):
+        return T.mean(T.eq(y, n_class))
+    
+    def accuracies_by_class(self, y, n_class):
+        return T.mean(T.and_(T.eq(y, self.y_out), T.eq(y, n_class)))
 
 class SoftmaxLayer(object):
 
@@ -303,6 +335,12 @@ class SoftmaxLayer(object):
     def accuracy(self, y):
         "Return the accuracy for the mini-batch."
         return T.mean(T.eq(y, self.y_out))
+    
+    def per_by_class(self, y, n_class):
+        return T.mean(T.eq(y, n_class))
+    
+    def accuracies_by_class(self, y, n_class):
+        return T.mean(T.and_(T.eq(y, self.y_out), T.eq(y, n_class)))
 
 
 #### Miscellanea
